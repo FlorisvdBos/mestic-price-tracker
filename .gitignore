@@ -1,3 +1,6 @@
 *.db
 __pycache__/
 *.pyc
+
+# generated
+dashboard.html
