@@ -1,0 +1,85 @@
+# retailers.toml  —  add a new retailer by adding a new [retailers.<id>] block.
+#
+# Supported methods:
+#   json_ld_brand_page  — brand/category page that embeds JSON-LD ItemList per page
+#   html_brand_page     — brand/category page with CSS-selectable product cards
+#   rest_api            — JSON REST search API (results filtered by brand in-memory)
+#
+# When a retailer's page is unreachable the scraper logs the error and skips it
+# for the day (no snapshots written), so the dashboard won't show stale "not
+# available" data.
+
+[defaults]
+request_delay = 1.5   # seconds between pages
+language     = "nl"
+enabled      = true
+
+# ── Dutch retailers ────────────────────────────────────────────────────────────
+
+[retailers.obelink]
+name          = "Obelink"
+method        = "json_ld_brand_page"
+brand_page_url = "https://www.obelink.nl/merken/mestic/"
+pagination_param = "p"          # URL param used for page 2+: ?p=2, ?p=3, …
+language       = "nl"
+
+[retailers.vrijbuiter]
+name          = "Vrijbuiter"
+method        = "rest_api"
+search_url    = "https://www.vrijbuiter.nl/api/search"
+query_param   = "q"             # URL param for the query
+search_query  = "Mestic"        # what to search for
+results_key   = "products"      # JSON key that holds the array of results
+name_path     = "name"          # dot-path to product name field
+price_path    = "price.inclTax" # dot-path to price (inc. tax)
+url_path      = "url"           # dot-path to product URL
+brand_filter_field  = "brand.name"  # filter results to this field …
+brand_filter_value  = "Mestic"       # … matching this value (case-insensitive)
+language      = "nl"
+
+# ── German retailers ───────────────────────────────────────────────────────────
+
+[retailers.fritz_berger]
+name          = "Fritz Berger"
+method        = "html_brand_page"
+brand_page_url = "https://www.fritz-berger.de/marken/mestic/"
+card_selector  = "div.element_artikel_gallery"
+name_selector  = ".element_artikel_gallery__name"
+price_selectors = [
+    "span.prod_price__discount_price",  # sale price (preferred)
+    "span.prod_price__price",           # regular price (fallback)
+]
+url_selector   = "a.element_artikel_gallery__link"
+price_locale   = "de"   # German: '.' = thousands, ',' = decimal, 'ab'/',-' stripped
+language       = "de"
+
+[retailers.wagner]
+name             = "Wagner"
+enabled          = true
+method           = "playwright_html_brand_page"
+brand_page_url   = "https://www.campingwagner.de/de/s//?q=Mestic"
+pagination_param = "page"
+card_selector    = "li.gallery-listing-v2__item"
+name_selector    = ".gallery-listing-v2__title a"
+price_selectors  = [
+    "p.gallery-listing-v2__price",     # sale / shown price
+    "p.gallery-listing-v2__uvp del",   # RRP fallback
+]
+url_selector     = "a.gallery-listing-v2__image-link"
+price_locale     = "de"
+language         = "de"
+
+# ── Template for a new retailer ────────────────────────────────────────────────
+# Copy and fill in for each new site.
+#
+# [retailers.new_retailer]
+# name           = "New Retailer"
+# method         = "html_brand_page"          # or json_ld_brand_page / rest_api
+# brand_page_url = "https://www.example.com/brands/mestic/"
+# card_selector  = "div.product-card"
+# name_selector  = ".product-name"
+# price_selectors = [".price-sale", ".price"]
+# url_selector   = "a.product-link"
+# price_locale   = "nl"                       # nl or de
+# language       = "nl"
+# request_delay  = 2.0                        # optional override
