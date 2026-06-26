@@ -68,11 +68,11 @@ export default function ProductTable({ scrollToId }: Props) {
   }
 
   const chartData = buildChartData(history);
-  const retailers = [...new Set(history.filter((h) => h.retailer !== "mestic.nl").map((h) => h.retailer))];
+  const retailers = Array.from(new Set(history.filter((h) => h.retailer !== "mestic.nl").map((h) => h.retailer)));
 
   if (loading) return <div className="text-muted-foreground text-sm py-8 text-center">Loading products…</div>;
 
-  const categories = [...new Set(products.map((p) => p.category))].sort();
+  const categories = Array.from(new Set(products.map((p) => p.category))).sort();
 
   return (
     <>
