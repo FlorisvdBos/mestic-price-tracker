@@ -69,6 +69,80 @@ url_selector     = "a.gallery-listing-v2__image-link"
 price_locale     = "de"
 language         = "de"
 
+# ── Dutch webshops ────────────────────────────────────────────────────────────
+
+[retailers.kampeerhal_roden]
+name           = "Kampeerhal Roden"
+method         = "playwright_tweakwise"
+brand_page_url = "https://www.kampeerhalroden.nl/search-results?tn_q=mestic&tn_fk_ae-brand=Mestic"
+card_selector  = ".twn-starter__products-grid-item"
+tile_selector  = ".twn-product-tile-dynamic"
+language       = "nl"
+load_wait      = 5
+
+[retailers.bol_com]
+name       = "Bol.com"
+method     = "bol_react_router"
+search_url = "https://www.bol.com/nl/nl/s/?searchtext=mestic"
+language   = "nl"
+load_wait  = 8        # React Router needs time to hydrate
+max_pages  = 6        # 137 products ÷ 25 per page
+
+[retailers.van_den_elzen]
+name          = "Van den Elzen"
+method        = "playwright_js_extract"
+brand_page_url = "https://www.vdelzencaravans.nl/zoeken?keyword=mestic"
+language      = "nl"
+load_wait     = 5
+scroll        = true
+js_extract    = '''
+() => {
+    const BASE = 'https://www.vdelzencaravans.nl';
+    const results = [];
+    const links = Array.from(document.querySelectorAll('a[href*="/product/"]'));
+    for (const link of links) {
+        const nameEl = link.querySelector('span.font-semibold');
+        const name   = nameEl ? nameEl.textContent.trim() : '';
+        if (!name) continue;
+        const url = BASE + link.getAttribute('href');
+        let price = null;
+        const parent = link.parentElement;
+        const priceEl = parent && parent.querySelector('.text-theme-yellow span.font-semibold');
+        if (priceEl) {
+            const txt = priceEl.textContent.replace(/[€ .]/g, '').replace(',', '.').trim();
+            price = parseFloat(txt) || null;
+        }
+        results.push({name, url, price});
+    }
+    return results;
+}
+'''
+
+[retailers.kampeerwereld]
+name          = "Kampeerwereld"
+method        = "playwright_html_brand_page"
+brand_page_url = "https://www.kampeerwereld.nl/mestic/"
+card_selector  = ".product-box"
+name_selector  = "a.product-name"
+price_selectors = ["input[name='dtgs-gtm-product-price']"]
+price_attr     = "value"          # read the HTML value= attribute, not inner text
+url_selector   = "a.product-name"
+price_locale   = "nl"
+language       = "nl"
+load_wait      = 5                # seconds to wait after domcontentloaded (Shopware 6 hydration)
+
+# ── German retailers ───────────────────────────────────────────────────────────
+
+[retailers.amazon_de]
+name          = "Amazon.de"
+method        = "amazon_search_page"
+search_url    = "https://www.amazon.de/s?k=mestic"
+price_selectors = [".a-price .a-offscreen"]
+price_locale   = "de"
+language       = "de"
+request_delay  = 2.5              # be polite to Amazon
+max_pages      = 5
+
 # ── Template for a new retailer ────────────────────────────────────────────────
 # Copy and fill in for each new site.
 #

@@ -41,7 +41,10 @@ BASE_HEADERS = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "nl-NL,nl;q=0.9,de-DE;q=0.8,de;q=0.7,en;q=0.6",
-    "Accept-Encoding": "gzip, deflate, br",
+    # Accept-Encoding intentionally omitted: requests adds gzip/deflate automatically
+    # and can decompress them. Advertising brotli (br) causes servers to respond
+    # with brotli-encoded content that requests cannot decompress without the
+    # optional brotli package, resulting in garbled binary output.
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -241,6 +244,9 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
     Like html_brand_page but loads pages with a real Chromium browser (Playwright)
     to bypass WAF/bot-detection (e.g. Akamai) that rejects plain HTTP clients.
     Pagination is driven by appending &<pagination_param>=N to the URL.
+
+    Optional: price_attr = "value"  — reads the HTML `value` attribute of the price
+    element instead of its text content (useful for hidden inputs with numeric values).
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -250,10 +256,12 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
     price_sels   = cfg.get("price_selectors", ["p.gallery-listing-v2__price"])
     url_sel      = cfg.get("url_selector",    "a.gallery-listing-v2__image-link")
     price_locale = cfg.get("price_locale",    "de")
+    price_attr   = cfg.get("price_attr",      "text")   # "text" or "value"
     pag_param    = cfg.get("pagination_param", None)
     delay        = cfg.get("request_delay",   1.5)
     lang         = cfg.get("language",        "de")
     locale       = f"{lang}-{lang.upper()}"
+    load_wait    = cfg.get("load_wait",       0)        # extra sleep after page load (s)
 
     results: list[dict] = []
 
@@ -270,7 +278,10 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
                 sep = "&" if "?" in brand_url else "?"
                 url = f"{brand_url}{sep}{pag_param}={page_num}"
 
-            pg.goto(url, wait_until="networkidle", timeout=30000)
+            pg.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            if load_wait:
+                time.sleep(load_wait)
 
             try:
                 pg.wait_for_selector(card_sel, timeout=8000)
@@ -293,8 +304,15 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
                 for sel in price_sels:
                     price_el = card.select_one(sel)
                     if price_el:
-                        raw   = price_el.get_text(separator="", strip=True)
-                        price = parse_price(raw, locale=price_locale)
+                        if price_attr == "value":
+                            raw_val = price_el.get("value", "")
+                            try:
+                                price = float(raw_val) if raw_val else None
+                            except (TypeError, ValueError):
+                                price = None
+                        else:
+                            raw   = price_el.get_text(separator="", strip=True)
+                            price = parse_price(raw, locale=price_locale)
                         if price is not None:
                             break
 
@@ -315,6 +333,292 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
             page_num += 1
             time.sleep(delay)
 
+        browser.close()
+
+    return results
+
+
+def scrape_amazon_search_page(cfg: dict, session: requests.Session) -> list[dict]:
+    """
+    Amazon-style: plain HTTP search results page, ASIN-based product URLs.
+    Matches by model number extracted from the German/Dutch product title.
+    """
+    search_url   = cfg["search_url"]
+    base_url_m   = re.match(r"(https?://[^/]+)", search_url)
+    base_url     = base_url_m.group(1) if base_url_m else ""
+    card_sel     = cfg.get("card_selector",   "[data-component-type='s-search-result']")
+    name_sel     = cfg.get("name_selector",   "h2 span")
+    price_sels   = cfg.get("price_selectors", [".a-price .a-offscreen"])
+    price_locale = cfg.get("price_locale",    "de")
+    delay        = cfg.get("request_delay",   2.5)
+    max_pages    = cfg.get("max_pages",       5)
+
+    results: list[dict] = []
+    page = 1
+
+    while page <= max_pages:
+        url = search_url if page == 1 else f"{search_url}&page={page}"
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"    [warn] page {page}: {exc}")
+            break
+
+        soup  = BeautifulSoup(resp.text, "lxml")
+        cards = soup.select(card_sel)
+        if not cards:
+            break
+
+        page_items: list[dict] = []
+        for card in cards:
+            asin = card.get("data-asin", "")
+            if not asin:
+                continue
+
+            name_el = card.select_one(name_sel)
+            name    = name_el.get_text(strip=True) if name_el else ""
+            if not name:
+                continue
+
+            price = None
+            for sel in price_sels:
+                price_el = card.select_one(sel)
+                if price_el:
+                    price = parse_price(price_el.get_text(strip=True), locale=price_locale)
+                    if price is not None:
+                        break
+
+            prod_url = f"{base_url}/dp/{asin}"
+            page_items.append({"name": name, "price": price, "url": prod_url})
+
+        results.extend(page_items)
+        print(f"    page {page}: {len(page_items)} products")
+
+        next_btn = soup.select_one("a.s-pagination-next")
+        if not next_btn or "s-pagination-disabled" in next_btn.get("class", []):
+            break
+
+        page += 1
+        time.sleep(delay)
+
+    return results
+
+
+def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[dict]:
+    """
+    Tweakwise Navigator-style brand/search page (e.g. Kampeerhal Roden).
+    Playwright renders the page; product data lives in the `data-combinations`
+    JSON attribute on each `.twn-product-tile-dynamic` element.
+    Each card may have multiple size/colour variants — we take the cheapest.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    brand_url  = cfg["brand_page_url"]
+    card_sel   = cfg.get("card_selector", ".twn-starter__products-grid-item")
+    tile_sel   = cfg.get("tile_selector", ".twn-product-tile-dynamic")
+    delay      = cfg.get("request_delay", 1.5)
+    load_wait  = cfg.get("load_wait", 5)
+    lang       = cfg.get("language", "nl")
+    locale     = f"{lang}-{lang.upper()}"
+    base_url_m = re.match(r"(https?://[^/]+)", brand_url)
+    base_url   = base_url_m.group(1) if base_url_m else ""
+
+    results: list[dict] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(locale=locale)
+        pg      = ctx.new_page()
+        pg.goto(brand_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(load_wait)
+
+        try:
+            pg.wait_for_selector(tile_sel, timeout=8000)
+        except PWTimeout:
+            print(f"    [warn] Tweakwise tiles not found after {load_wait}s")
+            browser.close()
+            return results
+
+        soup  = BeautifulSoup(pg.content(), "lxml")
+        tiles = soup.select(tile_sel)
+        print(f"    found {len(tiles)} Tweakwise tiles")
+
+        for tile in tiles:
+            raw = tile.get("data-combinations", "")
+            if not raw:
+                continue
+            try:
+                combos = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            # Take the combination with the lowest price (skip if no price)
+            best: dict | None = None
+            for combo in combos:
+                price_raw = combo.get("price")
+                try:
+                    p = float(price_raw) if price_raw is not None else None
+                except (TypeError, ValueError):
+                    p = None
+                if p is None:
+                    continue
+                if best is None or p < best["price"]:
+                    prod_url = combo.get("url", "")
+                    if prod_url and not prod_url.startswith("http"):
+                        prod_url = base_url + prod_url
+                    best = {"name": combo.get("title", "").strip(),
+                            "price": p,
+                            "url": prod_url}
+
+            if best and best["name"]:
+                results.append(best)
+
+        browser.close()
+
+    print(f"    extracted {len(results)} products")
+    return results
+
+
+def scrape_bol_react_router(cfg: dict, session: requests.Session) -> list[dict]:
+    """
+    Bol.com search page — products live in the React Router loader-data object
+    injected as window.__reactRouterContext.  Playwright renders the page;
+    we read the JS object directly to get titles, URLs and prices.
+    Paginates through ?page=N up to metaData.maxPage.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    search_url = cfg["search_url"]
+    delay      = cfg.get("request_delay", 3.0)
+    load_wait  = cfg.get("load_wait", 8)
+    max_pages  = cfg.get("max_pages", 10)
+    lang       = cfg.get("language", "nl")
+    locale     = f"{lang}-{lang.upper()}"
+
+    results: list[dict] = []
+
+    JS_EXTRACT = """
+        () => {
+            const ld = (window.__reactRouterContext?.state?.loaderData || {});
+            const page = ld['routes/searchPage'] || {};
+            const products = page.products || [];
+            const maxPage  = (page.metaData || {}).maxPage || 1;
+            return {
+                maxPage,
+                items: products.map(p => {
+                    const offer = p.bestSellingOffer || {};
+                    const prod  = offer.product || {};
+                    const price = (offer.sellingPrice?.price?.amount) ?? null;
+                    return {
+                        title: prod.title || '',
+                        url:   prod.url   || '',
+                        price: price,
+                    };
+                })
+            };
+        }
+    """
+
+    with sync_playwright() as pw:
+        browser  = pw.chromium.launch(headless=True)
+        ctx      = browser.new_context(locale=locale)
+        pg       = ctx.new_page()
+        max_page = 1
+        page_num = 1
+
+        while page_num <= max_pages:
+            url = search_url if page_num == 1 else f"{search_url}&page={page_num}"
+            pg.goto(url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(load_wait)
+
+            try:
+                data = pg.evaluate(JS_EXTRACT)
+            except Exception as exc:
+                print(f"    [warn] JS eval failed page {page_num}: {exc}")
+                break
+
+            if page_num == 1:
+                max_page = min(data.get("maxPage", 1), max_pages)
+                print(f"    total pages: {max_page}")
+
+            items = data.get("items", [])
+            page_results = []
+            for item in items:
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
+                raw_url = item.get("url", "")
+                prod_url = ("https://www.bol.com" + raw_url) if raw_url.startswith("/") else raw_url
+                try:
+                    price = float(item["price"]) if item.get("price") is not None else None
+                except (TypeError, ValueError):
+                    price = None
+                page_results.append({"name": title, "price": price, "url": prod_url})
+
+            results.extend(page_results)
+            print(f"    page {page_num}/{max_page}: {len(page_results)} products")
+
+            if page_num >= max_page:
+                break
+            page_num += 1
+            time.sleep(delay)
+
+        browser.close()
+
+    return results
+
+
+def scrape_playwright_js_extract(cfg: dict, session: requests.Session) -> list[dict]:
+    """
+    Generic Playwright method that evaluates a JavaScript snippet on the page
+    and returns [{name, price, url}] objects.  The JS snippet is stored in
+    cfg['js_extract'] (a string of an arrow function body).
+
+    Also supports an optional cfg['scroll'] = true to scroll to the bottom
+    before evaluating.
+    """
+    from playwright.sync_api import sync_playwright
+
+    brand_url  = cfg["brand_page_url"]
+    js_fn      = cfg["js_extract"]
+    delay      = cfg.get("request_delay", 1.5)
+    load_wait  = cfg.get("load_wait", 5)
+    do_scroll  = cfg.get("scroll", False)
+    lang       = cfg.get("language", "nl")
+    locale     = f"{lang}-{lang.upper()}"
+
+    results: list[dict] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(locale=locale)
+        pg      = ctx.new_page()
+        pg.goto(brand_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(load_wait)
+        if do_scroll:
+            pg.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(2)
+
+        try:
+            raw = pg.evaluate(js_fn)
+        except Exception as exc:
+            print(f"    [error] JS eval: {exc}")
+            browser.close()
+            return results
+
+        if isinstance(raw, list):
+            for item in raw:
+                name  = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                try:
+                    price = float(item["price"]) if item.get("price") is not None else None
+                except (TypeError, ValueError):
+                    price = None
+                results.append({"name": name, "price": price, "url": item.get("url", "")})
+
+        print(f"    extracted {len(results)} products")
         browser.close()
 
     return results
@@ -370,6 +674,10 @@ METHODS = {
     "json_ld_brand_page":          scrape_json_ld_brand_page,
     "html_brand_page":             scrape_html_brand_page,
     "playwright_html_brand_page":  scrape_playwright_html_brand_page,
+    "playwright_tweakwise":        scrape_playwright_tweakwise,
+    "bol_react_router":            scrape_bol_react_router,
+    "playwright_js_extract":       scrape_playwright_js_extract,
+    "amazon_search_page":          scrape_amazon_search_page,
     "rest_api":                    scrape_rest_api,
 }
 
