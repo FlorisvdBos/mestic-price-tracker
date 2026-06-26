@@ -32,12 +32,12 @@ def load_data() -> dict:
                ps.price_eur AS msrp
         FROM products p
         LEFT JOIN price_snapshots ps
-               ON ps.product_id = p.id
-              AND ps.retailer = 'mestic.nl'
-              AND ps.scraped_date = (
-                  SELECT MAX(s.scraped_date) FROM price_snapshots s
-                  WHERE s.retailer = 'mestic.nl' AND s.product_id = p.id
-              )
+               ON ps.id = (
+                   SELECT id FROM price_snapshots s
+                   WHERE s.retailer = 'mestic.nl' AND s.product_id = p.id
+                   ORDER BY s.scraped_date DESC, s.id DESC
+                   LIMIT 1
+               )
         ORDER BY p.category, p.product_name
     """).fetchall()
 
@@ -383,19 +383,29 @@ tr:last-child td { border-bottom: none; }
 const DATA = ___DATA___;
 
 const RETAILER_LABELS = {
-  "mestic.nl":   "Mestic.nl (MSRP)",
-  fritz_berger:  "Fritz Berger",
-  obelink:       "Obelink",
-  vrijbuiter:    "Vrijbuiter",
-  wagner:        "Wagner",
+  "mestic.nl":      "Mestic.nl (MSRP)",
+  fritz_berger:     "Fritz Berger",
+  obelink:          "Obelink",
+  vrijbuiter:       "Vrijbuiter",
+  wagner:           "Wagner",
+  kampeerhal_roden: "Kampeerhal Roden",
+  bol_com:          "Bol.com",
+  van_den_elzen:    "Van den Elzen",
+  amazon_de:        "Amazon.de",
+  kampeerwereld:    "Kampeerwereld",
 };
 
 const RETAILER_COLORS = {
-  "mestic.nl":  { border: "#9ca3af", fill: "rgba(156,163,175,.08)", dash: [6,3] },
-  fritz_berger: { border: "#3b82f6", fill: "rgba(59,130,246,.08)",  dash: [] },
-  obelink:      { border: "#10b981", fill: "rgba(16,185,129,.08)",  dash: [] },
-  vrijbuiter:   { border: "#f59e0b", fill: "rgba(245,158,11,.08)",  dash: [] },
-  wagner:       { border: "#8b5cf6", fill: "rgba(139,92,246,.08)",  dash: [] },
+  "mestic.nl":      { border: "#9ca3af", fill: "rgba(156,163,175,.08)", dash: [6,3] },
+  fritz_berger:     { border: "#3b82f6", fill: "rgba(59,130,246,.08)",  dash: [] },
+  obelink:          { border: "#10b981", fill: "rgba(16,185,129,.08)",  dash: [] },
+  vrijbuiter:       { border: "#f59e0b", fill: "rgba(245,158,11,.08)",  dash: [] },
+  wagner:           { border: "#8b5cf6", fill: "rgba(139,92,246,.08)",  dash: [] },
+  kampeerhal_roden: { border: "#ec4899", fill: "rgba(236,72,153,.08)",  dash: [] },
+  bol_com:          { border: "#f97316", fill: "rgba(249,115,22,.08)",   dash: [] },
+  van_den_elzen:    { border: "#14b8a6", fill: "rgba(20,184,166,.08)",   dash: [] },
+  amazon_de:        { border: "#eab308", fill: "rgba(234,179,8,.08)",    dash: [] },
+  kampeerwereld:    { border: "#ef4444", fill: "rgba(239,68,68,.08)",    dash: [] },
 };
 
 function fmt(n) {

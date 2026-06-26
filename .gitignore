@@ -3,5 +3,4 @@
 __pycache__/
 *.pyc
 
-# generated
-dashboard.html
+# dashboard.html is committed so GitHub Pages can serve it
