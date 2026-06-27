@@ -175,7 +175,7 @@ export default function ProductTable({ scrollToId }: Props) {
                 <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                 <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                 <YAxis tickFormatter={(v) => `€${v}`} tick={{ fontSize: 11 }} width={60} />
-                <Tooltip formatter={(v: number) => fmt(v)} />
+                <Tooltip formatter={(v) => fmt(v as number)} />
                 <Legend />
                 {retailers.map((r, i) => (
                   <Line
