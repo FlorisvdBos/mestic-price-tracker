@@ -41,6 +41,8 @@ jobs:
         run: python3 scraper_mestic.py
 
       - name: Scrape retailers
+        env:
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python3 scraper_retailers.py
 
       - name: Generate dashboard

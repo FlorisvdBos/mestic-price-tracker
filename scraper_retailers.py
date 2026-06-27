@@ -15,11 +15,13 @@ Usage:
 """
 
 import json
+import os
 import re
 import sqlite3
 import sys
 import time
 import tomllib
+import warnings
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -27,9 +29,11 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-DB_PATH     = "mestic_tracker.db"
-CONFIG_FILE = "retailers.toml"
-TODAY       = date.today().isoformat()
+DB_PATH          = "mestic_tracker.db"
+CONFIG_FILE      = "retailers.toml"
+TODAY            = date.today().isoformat()
+SCRAPERAPI_KEY   = os.environ.get("SCRAPERAPI_KEY", "")
+SCRAPERAPI_PROXY = "http://proxy-server.scraperapi.com:8001"
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -157,6 +161,11 @@ def make_session(language: str = "nl") -> requests.Session:
 
 
 # ── scraping methods ──────────────────────────────────────────────────────────
+
+def _ctx_kwargs(cfg: dict) -> dict:
+    """Return extra kwargs for Playwright browser.new_context() when a proxy is set."""
+    proxy = cfg.get("_proxy")
+    return {"proxy": proxy, "ignore_https_errors": True} if proxy else {}
 
 def scrape_json_ld_brand_page(cfg: dict, session: requests.Session) -> list[dict]:
     """
@@ -296,7 +305,7 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(locale=locale)
+        ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
         pg      = ctx.new_page()
         page_num = 1
 
@@ -459,7 +468,7 @@ def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[di
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(locale=locale)
+        ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
         pg      = ctx.new_page()
 
         for attempt in range(max_retries):
@@ -566,7 +575,7 @@ def scrape_bol_react_router(cfg: dict, session: requests.Session) -> list[dict]:
 
     with sync_playwright() as pw:
         browser  = pw.chromium.launch(headless=True)
-        ctx      = browser.new_context(locale=locale)
+        ctx      = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
         pg       = ctx.new_page()
         max_page = 1
         page_num = 1
@@ -637,7 +646,7 @@ def scrape_playwright_js_extract(cfg: dict, session: requests.Session) -> list[d
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(locale=locale)
+        ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
         pg      = ctx.new_page()
         pg.goto(brand_url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(load_wait)
@@ -988,6 +997,25 @@ def run_retailer(
         print(f"  [ERROR] scrape failed: {exc}")
         traceback.print_exc()
         return
+
+    if len(items) == 0 and SCRAPERAPI_KEY:
+        print("  [fallback] 0 products — retrying via ScraperAPI proxy…")
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+        proxy_url = f"http://scraperapi:{SCRAPERAPI_KEY}@proxy-server.scraperapi.com:8001"
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+        session.verify = False
+        cfg_proxy = {**cfg, "_proxy": {
+            "server": SCRAPERAPI_PROXY,
+            "username": "scraperapi",
+            "password": SCRAPERAPI_KEY,
+        }}
+        try:
+            items = scrape_fn(cfg_proxy, session)
+            print(f"  [fallback] Retrieved {len(items)} products via ScraperAPI")
+        except Exception as exc:
+            import traceback
+            print(f"  [fallback] ScraperAPI also failed: {exc}")
+            traceback.print_exc()
 
     stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup,
                             all_db_products, product_map, article_lookup, name_index)
