@@ -35,6 +35,7 @@ price_path    = "price.inclTax" # dot-path to price (inc. tax)
 url_path      = "url"           # dot-path to product URL
 brand_filter_field  = "brand.name"  # filter results to this field …
 brand_filter_value  = "Mestic"       # … matching this value (case-insensitive)
+sku_path            = "number"       # retailer article number field
 language      = "nl"
 
 # ── German retailers ───────────────────────────────────────────────────────────

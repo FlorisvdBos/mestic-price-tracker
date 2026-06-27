@@ -81,9 +81,31 @@ def extract_article_from_url(url: str) -> str | None:
 
 
 def extract_model_from_name(name: str) -> str | None:
-    """Extract the Mestic model code (e.g. MCC-18, RTA-2200i) from a product name."""
+    """Extract the first Mestic model code from a product name."""
     m = re.search(r"\b([A-Z]{2,6}-\d{2,4}[a-zA-Z0-9]*)\b", name, re.IGNORECASE)
     return m.group(1).upper() if m else None
+
+
+def extract_models_from_name(name: str) -> list[str]:
+    """Extract all model codes, expanding combined pages like 'RTA-1700i/2200i' → ['RTA-1700I', 'RTA-2200I']."""
+    primary = re.findall(r"\b([A-Z]{2,6}-\d{2,4}[a-zA-Z0-9]*)\b", name, re.IGNORECASE)
+    if not primary:
+        return []
+    results: list[str] = []
+    for match in primary:
+        code = match.upper()
+        if code not in results:
+            results.append(code)
+        # Look for variant suffixes: "RTA-1700i/2200i" → also emit "RTA-2200I"
+        prefix_m = re.match(r"([A-Z]{2,6}-)", code)
+        if prefix_m:
+            pref = prefix_m.group(1)
+            pos = name.upper().find(code) + len(code)
+            for var in re.findall(r"/(\d{2,4}[A-Z0-9]*)", name[pos:pos + 30], re.IGNORECASE):
+                combined = (pref + var).upper()
+                if combined not in results:
+                    results.append(combined)
+    return results
 
 
 def parse_price(text: str, locale: str = "nl") -> float | None:
@@ -183,6 +205,7 @@ def scrape_json_ld_brand_page(cfg: dict, session: requests.Session) -> list[dict
                         "name":  item.get("name", "").strip(),
                         "price": price,
                         "url":   prod_url,
+                        "sku":   item.get("sku") or item.get("productID") or "",
                     })
 
         if not page_items:
@@ -396,7 +419,7 @@ def scrape_amazon_search_page(cfg: dict, session: requests.Session) -> list[dict
                         break
 
             prod_url = f"{base_url}/dp/{asin}"
-            page_items.append({"name": name, "price": price, "url": prod_url})
+            page_items.append({"name": name, "price": price, "url": prod_url, "sku": asin})
 
         results.extend(page_items)
         print(f"    page {page}: {len(page_items)} products")
@@ -488,7 +511,8 @@ def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[di
                         prod_url = base_url + prod_url
                     best = {"name": combo.get("title", "").strip(),
                             "price": p,
-                            "url": prod_url}
+                            "url": prod_url,
+                            "sku": str(combo.get("itemNumber") or combo.get("sku") or "")}
 
             if best and best["name"]:
                 results.append(best)
@@ -533,6 +557,7 @@ def scrape_bol_react_router(cfg: dict, session: requests.Session) -> list[dict]:
                         title: prod.title || '',
                         url:   prod.url   || '',
                         price: price,
+                        sku:   prod.ean || String(prod.id || ''),
                     };
                 })
             };
@@ -573,7 +598,8 @@ def scrape_bol_react_router(cfg: dict, session: requests.Session) -> list[dict]:
                     price = float(item["price"]) if item.get("price") is not None else None
                 except (TypeError, ValueError):
                     price = None
-                page_results.append({"name": title, "price": price, "url": prod_url})
+                page_results.append({"name": title, "price": price, "url": prod_url,
+                                     "sku": str(item.get("sku") or "")})
 
             results.extend(page_results)
             print(f"    page {page_num}/{max_page}: {len(page_results)} products")
@@ -655,6 +681,7 @@ def scrape_rest_api(cfg: dict, session: requests.Session) -> list[dict]:
     name_path    = cfg.get("name_path",    "name")
     price_path   = cfg.get("price_path",   "price")
     url_path     = cfg.get("url_path",     "url")
+    sku_path     = cfg.get("sku_path",     "")
     brand_field  = cfg.get("brand_filter_field",  "brand.name")
     brand_value  = cfg.get("brand_filter_value",  "Mestic").lower()
 
@@ -686,8 +713,9 @@ def scrape_rest_api(cfg: dict, session: requests.Session) -> list[dict]:
         except (TypeError, ValueError):
             price = None
         url = get_nested(item, url_path) or ""
+        sku = str(get_nested(item, sku_path) or "") if sku_path else ""
 
-        results.append({"name": name, "price": price, "url": url})
+        results.append({"name": name, "price": price, "url": url, "sku": sku})
 
     return results
 
@@ -717,7 +745,7 @@ def _tokenize(s: str) -> set[str]:
             if len(t) > 2 and t not in _NAME_STOP}
 
 
-def build_db_lookups(conn: sqlite3.Connection) -> tuple[dict, dict, dict, dict, list]:
+def build_db_lookups(conn: sqlite3.Connection) -> tuple[dict, dict, dict, dict, list, dict]:
     rows = conn.execute(
         "SELECT id, product_name, ean, model_number, article_number FROM products"
     ).fetchall()
@@ -726,7 +754,17 @@ def build_db_lookups(conn: sqlite3.Connection) -> tuple[dict, dict, dict, dict, 
     article_lookup = {r[4]: (r[0], r[1]) for r in rows if r[4]}
     name_index     = {r[0]: (r[1], _tokenize(r[1])) for r in rows}
     all_db         = [(r[0], r[1], r[2], r[3]) for r in rows]
-    return ean_lookup, model_lookup, article_lookup, name_index, all_db
+
+    # retailer_product_map: (retailer, map_key) → [product_id, ...]
+    # map_key is retailer SKU when available, otherwise retailer URL
+    product_map: dict[tuple[str, str], list[int]] = {}
+    for row in conn.execute(
+        "SELECT retailer, map_key, product_id FROM retailer_product_map"
+    ).fetchall():
+        key = (row[0], row[1])
+        product_map.setdefault(key, []).append(row[2])
+
+    return ean_lookup, model_lookup, article_lookup, name_index, all_db, product_map
 
 
 def _name_match(item_name: str, name_index: dict) -> tuple[int | None, float]:
@@ -747,40 +785,58 @@ def _name_match(item_name: str, name_index: dict) -> tuple[int | None, float]:
     return (best_pid, best_score) if best_score >= 0.35 else (None, 0.0)
 
 
-def match_item(
+def _map_key(item: dict) -> str:
+    """Stable key for the retailer_product_map: SKU if provided, else URL."""
+    return item.get("sku") or item.get("url") or ""
+
+
+def match_items_multi(
     item: dict,
+    retailer_id: str,
     ean_lookup: dict,
     model_lookup: dict,
+    product_map: dict,
     article_lookup: dict | None = None,
     name_index: dict | None = None,
-) -> tuple[int | None, str]:
-    """Return (product_id, method) or (None, 'no_match').
+) -> list[tuple[int, str]]:
+    """Return [(product_id, method), ...] — multiple entries for combined product pages.
 
-    Priority: ean → article → model → name_match (low confidence).
+    Priority: ean → map_lookup → article → model(s) → name_match.
     """
-    # 1. EAN embedded in retailer URL
-    ean = extract_ean_from_url(item.get("url", ""))
+    url  = item.get("url", "")
+    name = item.get("name", "")
+
+    # 1. EAN embedded in URL
+    ean = extract_ean_from_url(url)
     if ean and ean in ean_lookup:
-        return ean_lookup[ean][0], "ean"
+        return [(ean_lookup[ean][0], "ean")]
 
-    # 2. Mestic article number embedded in retailer URL
+    # 2. Persistent map: (retailer, map_key) → known products
+    key = _map_key(item)
+    if key:
+        pids = product_map.get((retailer_id, key))
+        if pids:
+            return [(pid, "map") for pid in pids]
+
+    # 3. Mestic article number embedded in URL
     if article_lookup:
-        article = extract_article_from_url(item.get("url", ""))
+        article = extract_article_from_url(url)
         if article and article in article_lookup:
-            return article_lookup[article][0], "article"
+            return [(article_lookup[article][0], "article")]
 
-    # 3. Model code extracted from product name
-    model = extract_model_from_name(item.get("name", ""))
-    if model and model in model_lookup:
-        return model_lookup[model][0], "model"
+    # 4. All model codes from name — handles combined pages like "RTA-1700i/2200i"
+    models = extract_models_from_name(name)
+    matched = [(model_lookup[m][0], "model") for m in models if m in model_lookup]
+    if matched:
+        return matched
 
-    # 4. Token-overlap name match (last resort, flagged as low confidence)
+    # 5. Token-overlap name match (last resort)
     if name_index:
-        pid, _score = _name_match(item.get("name", ""), name_index)
+        pid, _score = _name_match(name, name_index)
         if pid is not None:
-            return pid, "name_match"
+            return [(pid, "name_match")]
 
-    return None, "no_match"
+    return []
 
 
 # ── database ──────────────────────────────────────────────────────────────────
@@ -809,6 +865,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_snap_product_date
             ON price_snapshots(product_id, scraped_date);
+        CREATE TABLE IF NOT EXISTS retailer_product_map (
+            retailer    TEXT    NOT NULL,
+            map_key     TEXT    NOT NULL,
+            product_id  INTEGER NOT NULL REFERENCES products(id),
+            match_method TEXT   NOT NULL,
+            mapped_date  TEXT   NOT NULL,
+            PRIMARY KEY (retailer, map_key, product_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rp_map_lookup
+            ON retailer_product_map(retailer, map_key);
     """)
     conn.commit()
 
@@ -828,17 +894,24 @@ def write_snapshots(
     ean_lookup:       dict,
     model_lookup:     dict,
     all_db_products:  list,
+    product_map:      dict,
     article_lookup:   dict | None = None,
     name_index:       dict | None = None,
 ) -> dict:
     cur = conn.cursor()
     matched_ids: set[int] = set()
-    stats: dict[str, int] = {"ean": 0, "article": 0, "model": 0,
+    stats: dict[str, int] = {"ean": 0, "map": 0, "article": 0, "model": 0,
                               "name_match": 0, "no_match_retailer": 0, "not_available": 0}
 
     for item in items:
-        pid, method = match_item(item, ean_lookup, model_lookup, article_lookup, name_index)
-        if pid is not None:
+        matches = match_items_multi(item, retailer_id, ean_lookup, model_lookup, product_map,
+                                    article_lookup, name_index)
+        if not matches:
+            stats["no_match_retailer"] += 1
+            continue
+
+        key = _map_key(item)
+        for pid, method in matches:
             cur.execute("""
                 INSERT INTO price_snapshots
                     (product_id, retailer, price_eur, scraped_date, retailer_url, match_method)
@@ -846,8 +919,18 @@ def write_snapshots(
             """, (pid, retailer_id, item.get("price"), TODAY, item.get("url"), method))
             matched_ids.add(pid)
             stats[method] = stats.get(method, 0) + 1
-        else:
-            stats["no_match_retailer"] += 1
+
+            # Persist to map so future runs skip fuzzy matching
+            if method != "map" and key:
+                cur.execute("""
+                    INSERT OR IGNORE INTO retailer_product_map
+                        (retailer, map_key, product_id, match_method, mapped_date)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (retailer_id, key, pid, method, TODAY))
+                # Update in-memory map too so same-day re-runs benefit
+                product_map.setdefault((retailer_id, key), [])
+                if pid not in product_map[(retailer_id, key)]:
+                    product_map[(retailer_id, key)].append(pid)
 
     # Mark every unmatched DB product as not_available for this retailer today
     for pid, name, ean, model in all_db_products:
@@ -871,6 +954,7 @@ def run_retailer(
     ean_lookup:      dict,
     model_lookup:    dict,
     all_db_products: list,
+    product_map:     dict,
     article_lookup:  dict | None = None,
     name_index:      dict | None = None,
 ) -> None:
@@ -906,12 +990,12 @@ def run_retailer(
         return
 
     stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup,
-                            all_db_products, article_lookup, name_index)
+                            all_db_products, product_map, article_lookup, name_index)
 
     # Print result table
-    matched = stats.get("ean", 0) + stats.get("article", 0) + stats.get("model", 0) + stats.get("name_match", 0)
+    matched = sum(stats.get(m, 0) for m in ("ean", "map", "article", "model", "name_match"))
     print(f"  Matched: {matched}  "
-          f"(EAN={stats.get('ean',0)}, article={stats.get('article',0)}, "
+          f"(EAN={stats.get('ean',0)}, map={stats.get('map',0)}, article={stats.get('article',0)}, "
           f"model={stats.get('model',0)}, name={stats.get('name_match',0)})  "
           f"| Not at retailer: {stats['not_available']}  "
           f"| Unrecognised: {stats['no_match_retailer']}")
@@ -989,13 +1073,14 @@ def main() -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     ensure_schema(conn)
 
-    ean_lookup, model_lookup, article_lookup, name_index, all_db_products = build_db_lookups(conn)
+    ean_lookup, model_lookup, article_lookup, name_index, all_db_products, product_map = build_db_lookups(conn)
     print(f"DB: {len(all_db_products)} products loaded  "
-          f"(EAN={len(ean_lookup)}, article={len(article_lookup)}, model={len(model_lookup)})")
+          f"(EAN={len(ean_lookup)}, article={len(article_lookup)}, model={len(model_lookup)}, "
+          f"map_entries={len(product_map)})")
 
     for rid in run_ids:
         run_retailer(retailers[rid], conn, ean_lookup, model_lookup,
-                     all_db_products, article_lookup, name_index)
+                     all_db_products, product_map, article_lookup, name_index)
 
     print(f"\n{'═'*60}")
     print(f"All done. Summary for {TODAY}:")
