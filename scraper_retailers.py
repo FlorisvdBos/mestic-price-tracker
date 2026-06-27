@@ -74,6 +74,12 @@ def extract_ean_from_url(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def extract_article_from_url(url: str) -> str | None:
+    """Return Mestic 7-digit article number (15xxxxx) if embedded in a retailer URL."""
+    m = re.search(r"[\-/_](15\d{5})(?:[/_\-.]|$)", url)
+    return m.group(1) if m else None
+
+
 def extract_model_from_name(name: str) -> str | None:
     """Extract the Mestic model code (e.g. MCC-18, RTA-2200i) from a product name."""
     m = re.search(r"\b([A-Z]{2,6}-\d{2,4}[a-zA-Z0-9]*)\b", name, re.IGNORECASE)
@@ -700,28 +706,79 @@ METHODS = {
 
 # ── matching ──────────────────────────────────────────────────────────────────
 
-def build_db_lookups(conn: sqlite3.Connection) -> tuple[dict, dict, list]:
+_NAME_STOP = {
+    "mestic", "de", "nl", "en", "met", "voor", "und", "mit", "für",
+    "ac", "dc", "le", "la", "per", "van", "the",
+}
+
+
+def _tokenize(s: str) -> set[str]:
+    return {t for t in re.split(r"[\s/\-,\.()\[\]]+", s.lower())
+            if len(t) > 2 and t not in _NAME_STOP}
+
+
+def build_db_lookups(conn: sqlite3.Connection) -> tuple[dict, dict, dict, dict, list]:
     rows = conn.execute(
-        "SELECT id, product_name, ean, model_number FROM products"
+        "SELECT id, product_name, ean, model_number, article_number FROM products"
     ).fetchall()
-    ean_lookup   = {r[2]: (r[0], r[1]) for r in rows if r[2]}
-    model_lookup = {r[3].upper(): (r[0], r[1]) for r in rows if r[3]}
-    return ean_lookup, model_lookup, rows
+    ean_lookup     = {r[2]: (r[0], r[1]) for r in rows if r[2]}
+    model_lookup   = {r[3].upper(): (r[0], r[1]) for r in rows if r[3]}
+    article_lookup = {r[4]: (r[0], r[1]) for r in rows if r[4]}
+    name_index     = {r[0]: (r[1], _tokenize(r[1])) for r in rows}
+    all_db         = [(r[0], r[1], r[2], r[3]) for r in rows]
+    return ean_lookup, model_lookup, article_lookup, name_index, all_db
+
+
+def _name_match(item_name: str, name_index: dict) -> tuple[int | None, float]:
+    """Jaccard token overlap against all DB product names; returns best (pid, score)."""
+    item_tokens = _tokenize(item_name)
+    if not item_tokens:
+        return None, 0.0
+    best_pid, best_score = None, 0.0
+    for pid, (_pname, ptokens) in name_index.items():
+        if not ptokens:
+            continue
+        overlap = len(item_tokens & ptokens)
+        if not overlap:
+            continue
+        score = overlap / len(item_tokens | ptokens)
+        if score > best_score:
+            best_score, best_pid = score, pid
+    return (best_pid, best_score) if best_score >= 0.35 else (None, 0.0)
 
 
 def match_item(
     item: dict,
     ean_lookup: dict,
     model_lookup: dict,
+    article_lookup: dict | None = None,
+    name_index: dict | None = None,
 ) -> tuple[int | None, str]:
-    """Return (product_id, method) or (None, 'no_match')."""
+    """Return (product_id, method) or (None, 'no_match').
+
+    Priority: ean → article → model → name_match (low confidence).
+    """
+    # 1. EAN embedded in retailer URL
     ean = extract_ean_from_url(item.get("url", ""))
     if ean and ean in ean_lookup:
         return ean_lookup[ean][0], "ean"
 
+    # 2. Mestic article number embedded in retailer URL
+    if article_lookup:
+        article = extract_article_from_url(item.get("url", ""))
+        if article and article in article_lookup:
+            return article_lookup[article][0], "article"
+
+    # 3. Model code extracted from product name
     model = extract_model_from_name(item.get("name", ""))
     if model and model in model_lookup:
         return model_lookup[model][0], "model"
+
+    # 4. Token-overlap name match (last resort, flagged as low confidence)
+    if name_index:
+        pid, _score = _name_match(item.get("name", ""), name_index)
+        if pid is not None:
+            return pid, "name_match"
 
     return None, "no_match"
 
@@ -771,13 +828,16 @@ def write_snapshots(
     ean_lookup:       dict,
     model_lookup:     dict,
     all_db_products:  list,
+    article_lookup:   dict | None = None,
+    name_index:       dict | None = None,
 ) -> dict:
     cur = conn.cursor()
     matched_ids: set[int] = set()
-    stats = {"ean": 0, "model": 0, "no_match_retailer": 0, "not_available": 0}
+    stats: dict[str, int] = {"ean": 0, "article": 0, "model": 0,
+                              "name_match": 0, "no_match_retailer": 0, "not_available": 0}
 
     for item in items:
-        pid, method = match_item(item, ean_lookup, model_lookup)
+        pid, method = match_item(item, ean_lookup, model_lookup, article_lookup, name_index)
         if pid is not None:
             cur.execute("""
                 INSERT INTO price_snapshots
@@ -806,11 +866,13 @@ def write_snapshots(
 # ── per-retailer runner ───────────────────────────────────────────────────────
 
 def run_retailer(
-    cfg:      dict,
-    conn:     sqlite3.Connection,
-    ean_lookup:  dict,
-    model_lookup: dict,
+    cfg:             dict,
+    conn:            sqlite3.Connection,
+    ean_lookup:      dict,
+    model_lookup:    dict,
     all_db_products: list,
+    article_lookup:  dict | None = None,
+    name_index:      dict | None = None,
 ) -> None:
     rid  = cfg["id"]
     name = cfg.get("name", rid)
@@ -843,14 +905,16 @@ def run_retailer(
         traceback.print_exc()
         return
 
-    stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup, all_db_products)
+    stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup,
+                            all_db_products, article_lookup, name_index)
 
     # Print result table
-    matched = stats.get("ean", 0) + stats.get("model", 0)
+    matched = stats.get("ean", 0) + stats.get("article", 0) + stats.get("model", 0) + stats.get("name_match", 0)
     print(f"  Matched: {matched}  "
-          f"(by EAN={stats.get('ean',0)}, model={stats.get('model',0)})  "
+          f"(EAN={stats.get('ean',0)}, article={stats.get('article',0)}, "
+          f"model={stats.get('model',0)}, name={stats.get('name_match',0)})  "
           f"| Not at retailer: {stats['not_available']}  "
-          f"| Unrecognised items: {stats['no_match_retailer']}")
+          f"| Unrecognised: {stats['no_match_retailer']}")
 
     # Price comparison
     _print_price_comparison(conn, rid)
@@ -925,11 +989,13 @@ def main() -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     ensure_schema(conn)
 
-    ean_lookup, model_lookup, all_db_products = build_db_lookups(conn)
-    print(f"DB: {len(all_db_products)} products loaded")
+    ean_lookup, model_lookup, article_lookup, name_index, all_db_products = build_db_lookups(conn)
+    print(f"DB: {len(all_db_products)} products loaded  "
+          f"(EAN={len(ean_lookup)}, article={len(article_lookup)}, model={len(model_lookup)})")
 
     for rid in run_ids:
-        run_retailer(retailers[rid], conn, ean_lookup, model_lookup, all_db_products)
+        run_retailer(retailers[rid], conn, ean_lookup, model_lookup,
+                     all_db_products, article_lookup, name_index)
 
     print(f"\n{'═'*60}")
     print(f"All done. Summary for {TODAY}:")

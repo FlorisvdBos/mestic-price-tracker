@@ -42,7 +42,7 @@ language      = "nl"
 [retailers.fritz_berger]
 name          = "Fritz Berger"
 method        = "html_brand_page"
-brand_page_url = "https://www.fritz-berger.de/marken/mestic/"
+brand_page_url = "https://www.berger-camping.nl/marken/mestic/"
 card_selector  = "div.element_artikel_gallery"
 name_selector  = ".element_artikel_gallery__name"
 price_selectors = [
@@ -50,8 +50,8 @@ price_selectors = [
     "span.prod_price__price",           # regular price (fallback)
 ]
 url_selector   = "a.element_artikel_gallery__link"
-price_locale   = "de"   # German: '.' = thousands, ',' = decimal, 'ab'/',-' stripped
-language       = "de"
+price_locale   = "de"   # European: '.' = thousands, ',' = decimal
+language       = "nl"
 
 [retailers.wagner]
 name             = "Wagner"
