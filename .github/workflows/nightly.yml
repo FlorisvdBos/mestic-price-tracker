@@ -53,6 +53,7 @@ jobs:
           git add mestic_tracker.db
           if ! git diff --staged --quiet; then
             git commit -m "data: scrape $(date -u +'%Y-%m-%d')"
+            git pull --rebase
             git push
           fi
 
