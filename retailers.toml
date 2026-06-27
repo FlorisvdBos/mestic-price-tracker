@@ -57,7 +57,7 @@ language       = "de"
 name             = "Wagner"
 enabled          = true
 method           = "playwright_html_brand_page"
-brand_page_url   = "https://www.campingwagner.de/de/s//?q=Mestic"
+brand_page_url   = "https://www.campingwagner.de/de/s/?q=Mestic"
 pagination_param = "page"
 card_selector    = "li.gallery-listing-v2__item"
 name_selector    = ".gallery-listing-v2__title a"
@@ -68,6 +68,7 @@ price_selectors  = [
 url_selector     = "a.gallery-listing-v2__image-link"
 price_locale     = "de"
 language         = "de"
+load_wait        = 5
 
 # ── Dutch webshops ────────────────────────────────────────────────────────────
 
@@ -78,7 +79,9 @@ brand_page_url = "https://www.kampeerhalroden.nl/search-results?tn_q=mestic&tn_f
 card_selector  = ".twn-starter__products-grid-item"
 tile_selector  = ".twn-product-tile-dynamic"
 language       = "nl"
-load_wait      = 5
+load_wait      = 10
+goto_timeout   = 60000
+max_retries    = 2
 
 [retailers.bol_com]
 name       = "Bol.com"

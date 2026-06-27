@@ -414,15 +414,17 @@ def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[di
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    brand_url  = cfg["brand_page_url"]
-    card_sel   = cfg.get("card_selector", ".twn-starter__products-grid-item")
-    tile_sel   = cfg.get("tile_selector", ".twn-product-tile-dynamic")
-    delay      = cfg.get("request_delay", 1.5)
-    load_wait  = cfg.get("load_wait", 5)
-    lang       = cfg.get("language", "nl")
-    locale     = f"{lang}-{lang.upper()}"
-    base_url_m = re.match(r"(https?://[^/]+)", brand_url)
-    base_url   = base_url_m.group(1) if base_url_m else ""
+    brand_url    = cfg["brand_page_url"]
+    card_sel     = cfg.get("card_selector", ".twn-starter__products-grid-item")
+    tile_sel     = cfg.get("tile_selector", ".twn-product-tile-dynamic")
+    delay        = cfg.get("request_delay", 1.5)
+    load_wait    = cfg.get("load_wait", 5)
+    goto_timeout = cfg.get("goto_timeout", 60000)
+    max_retries  = cfg.get("max_retries", 2)
+    lang         = cfg.get("language", "nl")
+    locale       = f"{lang}-{lang.upper()}"
+    base_url_m   = re.match(r"(https?://[^/]+)", brand_url)
+    base_url     = base_url_m.group(1) if base_url_m else ""
 
     results: list[dict] = []
 
@@ -430,13 +432,24 @@ def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[di
         browser = pw.chromium.launch(headless=True)
         ctx     = browser.new_context(locale=locale)
         pg      = ctx.new_page()
-        pg.goto(brand_url, wait_until="domcontentloaded", timeout=30000)
+
+        for attempt in range(max_retries):
+            try:
+                pg.goto(brand_url, wait_until="domcontentloaded", timeout=goto_timeout)
+                break
+            except PWTimeout:
+                if attempt == max_retries - 1:
+                    print(f"    [warn] page load timed out after {max_retries} attempts")
+                    browser.close()
+                    return results
+                print(f"    [warn] page load attempt {attempt + 1} timed out, retrying…")
+
         time.sleep(load_wait)
 
         try:
-            pg.wait_for_selector(tile_sel, timeout=8000)
+            pg.wait_for_selector(tile_sel, timeout=15000)
         except PWTimeout:
-            print(f"    [warn] Tweakwise tiles not found after {load_wait}s")
+            print(f"    [warn] Tweakwise tiles not found after {load_wait}s wait")
             browser.close()
             return results
 
@@ -640,7 +653,10 @@ def scrape_rest_api(cfg: dict, session: requests.Session) -> list[dict]:
     brand_value  = cfg.get("brand_filter_value",  "Mestic").lower()
 
     try:
-        resp = session.get(search_url, params={query_param: query}, timeout=20)
+        resp = session.get(
+            search_url, params={query_param: query}, timeout=20,
+            headers={"Accept": "application/json, text/plain, */*"},
+        )
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, json.JSONDecodeError) as exc:
@@ -817,9 +833,15 @@ def run_retailer(
         return
 
     session = make_session(cfg.get("language", "nl"))
-    print(f"  Fetching …")
-    items = scrape_fn(cfg, session)
-    print(f"  Retrieved {len(items)} products")
+    try:
+        print(f"  Fetching …")
+        items = scrape_fn(cfg, session)
+        print(f"  Retrieved {len(items)} products")
+    except Exception as exc:
+        import traceback
+        print(f"  [ERROR] scrape failed: {exc}")
+        traceback.print_exc()
+        return
 
     stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup, all_db_products)
 
