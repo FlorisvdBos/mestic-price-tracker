@@ -162,10 +162,28 @@ def make_session(language: str = "nl") -> requests.Session:
 
 # ── scraping methods ──────────────────────────────────────────────────────────
 
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+_STEALTH_INIT = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+_STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+
+
 def _ctx_kwargs(cfg: dict) -> dict:
-    """Return extra kwargs for Playwright browser.new_context() when a proxy is set."""
+    """Return extra kwargs for Playwright browser.new_context() (proxy + stealth UA)."""
     proxy = cfg.get("_proxy")
-    return {"proxy": proxy, "ignore_https_errors": True} if proxy else {}
+    kwargs: dict = {"user_agent": _STEALTH_UA}
+    if proxy:
+        kwargs["proxy"] = proxy
+        kwargs["ignore_https_errors"] = True
+    return kwargs
+
+
+def _apply_stealth(ctx) -> None:
+    """Mask navigator.webdriver so pages can't detect headless Playwright."""
+    ctx.add_init_script(_STEALTH_INIT)
 
 def scrape_json_ld_brand_page(cfg: dict, session: requests.Session) -> list[dict]:
     """
@@ -277,6 +295,89 @@ def scrape_html_brand_page(cfg: dict, session: requests.Session) -> list[dict]:
     return results
 
 
+def _parse_brand_page_soup(soup: "BeautifulSoup", cfg: dict, base_url: str) -> list[dict]:
+    """Extract product items from a pre-parsed brand/search page soup."""
+    card_sel     = cfg.get("card_selector",   "li.gallery-listing-v2__item")
+    name_sel     = cfg.get("name_selector",   ".gallery-listing-v2__title a")
+    price_sels   = cfg.get("price_selectors", ["p.gallery-listing-v2__price"])
+    url_sel      = cfg.get("url_selector",    "a.gallery-listing-v2__image-link")
+    price_locale = cfg.get("price_locale",    "de")
+    price_attr   = cfg.get("price_attr",      "text")
+
+    cards = soup.select(card_sel)
+    items: list[dict] = []
+    for card in cards:
+        name_el = card.select_one(name_sel)
+        name    = name_el.get_text(strip=True) if name_el else ""
+        if not name:
+            continue
+
+        price = None
+        for sel in price_sels:
+            price_el = card.select_one(sel)
+            if price_el:
+                if price_attr == "value":
+                    try:
+                        price = float(price_el.get("value", "") or "")
+                    except (TypeError, ValueError):
+                        price = None
+                else:
+                    price = parse_price(price_el.get_text(separator="", strip=True), locale=price_locale)
+                if price is not None:
+                    break
+
+        url_el   = card.select_one(url_sel)
+        prod_url = url_el.get("href", "") if url_el else ""
+        if prod_url and not prod_url.startswith("http"):
+            prod_url = base_url + prod_url
+
+        items.append({"name": name, "price": price, "url": prod_url})
+    return items
+
+
+def scrape_scraperapi_render_brand_page(cfg: dict, session: requests.Session) -> list[dict]:
+    """
+    Fetch brand/search pages via ScraperAPI's own JS-rendering service
+    (api.scraperapi.com?render=true) instead of routing a local Playwright
+    browser through the proxy.  Used as a fallback when local Playwright is
+    blocked by WAF/bot-detection.
+    """
+    brand_url = cfg["brand_page_url"]
+    pag_param = cfg.get("pagination_param", None)
+    delay     = cfg.get("request_delay", 1.5)
+    base_url  = re.match(r"(https?://[^/]+)", brand_url)
+    base_url  = base_url.group(1) if base_url else ""
+
+    results: list[dict] = []
+    page_num = 1
+
+    while True:
+        if page_num == 1:
+            url = brand_url
+        else:
+            sep = "&" if "?" in brand_url else "?"
+            url = f"{brand_url}{sep}{pag_param}={page_num}"
+
+        resp = session.get(
+            "https://api.scraperapi.com",
+            params={"api_key": SCRAPERAPI_KEY, "url": url, "render": "true"},
+            timeout=90,
+        )
+        resp.raise_for_status()
+
+        soup  = BeautifulSoup(resp.text, "lxml")
+        items = _parse_brand_page_soup(soup, cfg, base_url)
+        print(f"    page {page_num}: {len(items)} products (via ScraperAPI render)")
+
+        results.extend(items)
+        if not pag_param or not items:
+            break
+        page_num += 1
+        time.sleep(delay)
+
+    return results
+
+
 def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> list[dict]:
     """
     Like html_brand_page but loads pages with a real Chromium browser (Playwright)
@@ -290,22 +391,20 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
 
     brand_url    = cfg["brand_page_url"]
     card_sel     = cfg.get("card_selector",   "li.gallery-listing-v2__item")
-    name_sel     = cfg.get("name_selector",   ".gallery-listing-v2__title a")
-    price_sels   = cfg.get("price_selectors", ["p.gallery-listing-v2__price"])
-    url_sel      = cfg.get("url_selector",    "a.gallery-listing-v2__image-link")
-    price_locale = cfg.get("price_locale",    "de")
-    price_attr   = cfg.get("price_attr",      "text")   # "text" or "value"
     pag_param    = cfg.get("pagination_param", None)
     delay        = cfg.get("request_delay",   1.5)
     lang         = cfg.get("language",        "de")
     locale       = f"{lang}-{lang.upper()}"
     load_wait    = cfg.get("load_wait",       0)        # extra sleep after page load (s)
+    base_url_m   = re.match(r"(https?://[^/]+)", brand_url)
+    base_url     = base_url_m.group(1) if base_url_m else ""
 
     results: list[dict] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=True, args=_STEALTH_ARGS)
         ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
+        _apply_stealth(ctx)
         pg      = ctx.new_page()
         page_num = 1
 
@@ -327,40 +426,9 @@ def scrape_playwright_html_brand_page(cfg: dict, session: requests.Session) -> l
                 break
 
             soup  = BeautifulSoup(pg.content(), "lxml")
-            cards = soup.select(card_sel)
-            if not cards:
+            page_items = _parse_brand_page_soup(soup, cfg, base_url)
+            if not page_items:
                 break
-
-            page_items: list[dict] = []
-            for card in cards:
-                name_el = card.select_one(name_sel)
-                name    = name_el.get_text(strip=True) if name_el else ""
-                if not name:
-                    continue
-
-                price = None
-                for sel in price_sels:
-                    price_el = card.select_one(sel)
-                    if price_el:
-                        if price_attr == "value":
-                            raw_val = price_el.get("value", "")
-                            try:
-                                price = float(raw_val) if raw_val else None
-                            except (TypeError, ValueError):
-                                price = None
-                        else:
-                            raw   = price_el.get_text(separator="", strip=True)
-                            price = parse_price(raw, locale=price_locale)
-                        if price is not None:
-                            break
-
-                url_el   = card.select_one(url_sel)
-                prod_url = url_el.get("href", "") if url_el else ""
-                if prod_url and not prod_url.startswith("http"):
-                    base     = re.match(r"(https?://[^/]+)", brand_url)
-                    prod_url = (base.group(1) if base else "") + prod_url
-
-                page_items.append({"name": name, "price": price, "url": prod_url})
 
             results.extend(page_items)
             print(f"    page {page_num}: {len(page_items)} products")
@@ -467,8 +535,9 @@ def scrape_playwright_tweakwise(cfg: dict, session: requests.Session) -> list[di
     results: list[dict] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=True, args=_STEALTH_ARGS)
         ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
+        _apply_stealth(ctx)
         pg      = ctx.new_page()
 
         for attempt in range(max_retries):
@@ -574,8 +643,9 @@ def scrape_bol_react_router(cfg: dict, session: requests.Session) -> list[dict]:
     """
 
     with sync_playwright() as pw:
-        browser  = pw.chromium.launch(headless=True)
+        browser  = pw.chromium.launch(headless=True, args=_STEALTH_ARGS)
         ctx      = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
+        _apply_stealth(ctx)
         pg       = ctx.new_page()
         max_page = 1
         page_num = 1
@@ -645,8 +715,9 @@ def scrape_playwright_js_extract(cfg: dict, session: requests.Session) -> list[d
     results: list[dict] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=True, args=_STEALTH_ARGS)
         ctx     = browser.new_context(locale=locale, **_ctx_kwargs(cfg))
+        _apply_stealth(ctx)
         pg      = ctx.new_page()
         pg.goto(brand_url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(load_wait)
@@ -999,23 +1070,35 @@ def run_retailer(
         return
 
     if len(items) == 0 and SCRAPERAPI_KEY:
-        print("  [fallback] 0 products — retrying via ScraperAPI proxy…")
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-        proxy_url = f"http://scraperapi:{SCRAPERAPI_KEY}@proxy-server.scraperapi.com:8001"
-        session.proxies.update({"http": proxy_url, "https": proxy_url})
-        session.verify = False
-        cfg_proxy = {**cfg, "_proxy": {
-            "server": SCRAPERAPI_PROXY,
-            "username": "scraperapi",
-            "password": SCRAPERAPI_KEY,
-        }}
-        try:
-            items = scrape_fn(cfg_proxy, session)
-            print(f"  [fallback] Retrieved {len(items)} products via ScraperAPI")
-        except Exception as exc:
-            import traceback
-            print(f"  [fallback] ScraperAPI also failed: {exc}")
-            traceback.print_exc()
+        if method_key == "playwright_html_brand_page":
+            # Playwright proxy fallback doesn't help when WAF fingerprints the browser;
+            # use ScraperAPI's own JS renderer instead (they handle the browser side).
+            print("  [fallback] 0 products — retrying via ScraperAPI render API…")
+            try:
+                items = scrape_scraperapi_render_brand_page(cfg, session)
+                print(f"  [fallback] Retrieved {len(items)} products via ScraperAPI render")
+            except Exception as exc:
+                import traceback
+                print(f"  [fallback] ScraperAPI render failed: {exc}")
+                traceback.print_exc()
+        else:
+            print("  [fallback] 0 products — retrying via ScraperAPI proxy…")
+            proxy_url = f"http://scraperapi:{SCRAPERAPI_KEY}@proxy-server.scraperapi.com:8001"
+            session.proxies.update({"http": proxy_url, "https": proxy_url})
+            session.verify = False
+            cfg_proxy = {**cfg, "_proxy": {
+                "server": SCRAPERAPI_PROXY,
+                "username": "scraperapi",
+                "password": SCRAPERAPI_KEY,
+            }}
+            try:
+                items = scrape_fn(cfg_proxy, session)
+                print(f"  [fallback] Retrieved {len(items)} products via ScraperAPI proxy")
+            except Exception as exc:
+                import traceback
+                print(f"  [fallback] ScraperAPI proxy failed: {exc}")
+                traceback.print_exc()
 
     stats = write_snapshots(conn, rid, items, ean_lookup, model_lookup,
                             all_db_products, product_map, article_lookup, name_index)
