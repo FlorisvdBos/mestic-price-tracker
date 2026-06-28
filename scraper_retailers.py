@@ -959,7 +959,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+FORCE_RESCRAPE = os.environ.get("FORCE_RESCRAPE", "").lower() in ("1", "true", "yes")
+
+
 def already_scraped(conn: sqlite3.Connection, retailer_id: str) -> bool:
+    if FORCE_RESCRAPE:
+        return False
     row = conn.execute(
         "SELECT COUNT(*) FROM price_snapshots WHERE retailer=? AND scraped_date=?",
         (retailer_id, TODAY),
